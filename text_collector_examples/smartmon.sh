@@ -77,8 +77,6 @@ parse_smartctl_scsi_attributes() {
   local disk_type="$2"
   local phy_id="$3"
   local sas_address="$4"
-  #local data=$(cat)
-  #local phy_id=$(echo "${data}" | awk '/attached phy identifier =/{printf("%s",$5);exit;}')
   local labels="disk=\"${disk}\",type=\"${disk_type}\",phy_id=\"${phy_id}\",sas_address=\"${sas_address}\""
   
   awk -v tag="$labels" '
@@ -95,9 +93,7 @@ parse_smartctl_scsi_attributes() {
 parse_smartctl_info() {
   local -i smart_available=0 smart_enabled=0 smart_healthy=0
   local disk="$1" disk_type="$2" phy_id="$3" sas_address="$4"
-  #local data=$(cat)
-  #local phy_id=$(echo "${data}" | awk '/attached phy identifier =/{printf("%s",$5);exit;}')
-
+ 
   while read line ; do
     info_type="$(echo "${line}" | cut -f1 -d: | tr ' ' '_')"
     info_value="$(echo "${line}" | cut -f2- -d: | sed 's/^ \+//g')"
@@ -135,18 +131,16 @@ parse_smartctl_info() {
   fi
   echo "device_smart_available{disk=\"${disk}\",type=\"${disk_type}\"} ${smart_available}"
   echo "device_smart_enabled{disk=\"${disk}\",type=\"${disk_type}\"} ${smart_enabled}"
-
+  
   echo "device_smart_healthy{disk=\"${disk}\",type=\"${disk_type}\",phy_id=\"${phy_id}\",sas_address=\"${sas_address}\"} ${smart_healthy}"
+  
+  # TODO: Investigate, causes strange behaviour in grafana charting when this condition is enabled.
   #if [ ${type} = "scsi" ]; then
   #  echo "device_smart_healthy{disk=\"${disk}\",type=\"${disk_type}\",phy_id=\"${phy_id}\",sas_address=\"${sas_address}\"} ${smart_healthy}"
   #else
   #  echo "device_smart_healthy{disk=\"${disk}\",type=\"${disk_type}\"} ${smart_healthy}"
   #fi
 }
-
-#parse_smartctl_sas_info() {
-#  awk '/attached phy identifier =/{printf("%s",$5);exit;}'
-#}
 
 parse_smartctl_sas_info() {
   # Extract SAS info from Protocol Specific port log page for SAS SSP
@@ -159,7 +153,6 @@ parse_smartctl_sas_info() {
   # return values
   echo "${phy_id} ${sas_address}"
 }
-
 
 output_format_awk="$(cat << 'OUTPUTAWK'
 BEGIN { v = "" }
@@ -191,15 +184,18 @@ for device in ${device_list}; do
   disk="$(echo ${device} | cut -f1 -d'|')"
   type="$(echo ${device} | cut -f2 -d'|')"
   echo "smartctl_run{disk=\"${disk}\",type=\"${type}\"}" $(TZ=UTC date '+%s')
-  # Get the SMART information and health
-  #/usr/sbin/smartctl -i -H -d "${type}" "${disk}" | parse_smartctl_info "${disk}" "${type}"
-  # Get the SMART attributes
+
   if [ ${type} = "scsi" ]; then
+    # Get SAS Information from smartctl
     read phy_id sas_address <<< "$(/usr/sbin/smartctl -x -d "${type}" "${disk}" | parse_smartctl_sas_info)"
+    # Get the SMART information and health
     /usr/sbin/smartctl -i -H -d "${type}" "${disk}" | parse_smartctl_info "${disk}" "${type}" "${phy_id}" "${sas_address}"
+    # Get the SMART attributes
     /usr/sbin/smartctl -A -d "${type}" "${disk}" | parse_smartctl_scsi_attributes "${disk}" "${type}" "${phy_id}" "${sas_address}"
   else
+    # Get the SMART information and health
     /usr/sbin/smartctl -i -H -d "${type}" "${disk}" | parse_smartctl_info "${disk}" "${type}"
+    # Get the SMART attributes
     /usr/sbin/smartctl -A -d "${type}" "${disk}" | parse_smartctl_attributes "${disk}" "${type}"
   fi
 done | format_output
