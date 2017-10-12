@@ -7,6 +7,9 @@
 #       data in them than you'd think.
 #       http://arstechnica.com/civis/viewtopic.php?p=22062211
 
+# NOTES: Added smartmon scrape for SCSI drives, specifically targeting storage nodes where multiple
+#        drives are connected using the same SAS Address.  
+
 disks="$(/usr/sbin/smartctl --scan | awk '{print $1 "|" $3}')"
 
 parse_smartctl_attributes_awk="$(cat << 'SMARTCTLAWK'
@@ -69,16 +72,39 @@ parse_smartctl_attributes() {
     | grep -E "(${smartmon_attrs})"
 }
 
+parse_smartctl_scsi_attributes() {
+  local disk="$1"
+  local disk_type="$2"
+  local phy_id="$3"
+  local sas_address="$4"
+  #local data=$(cat)
+  #local phy_id=$(echo "${data}" | awk '/attached phy identifier =/{printf("%s",$5);exit;}')
+  local labels="disk=\"${disk}\",type=\"${disk_type}\",phy_id=\"${phy_id}\",sas_address=\"${sas_address}\""
+  
+  awk -v tag="$labels" '
+  /Current Drive Temperature:/{printf("current_drive_temperature_cel_value{"tag"} %s\n",$4);}
+  /Drive Trip Temperature:/{printf("drive_trip_temperature_cel_value{"tag"} %s\n",$4);}
+  /Specified cycle count over device lifetime:/{printf("specified_start_stop_cycles_lifetime_value{"tag"} %s\n",$7);}
+  /Accumulated start-stop cycles:/{printf("accumulated_start_stop_cycles_value{"tag"} %s\n",$4);}
+  /Specified load-unload count over device lifetime:/{printf("specified_load_unload_cycles_lifetime_value{"tag"} %s\n",$7);}
+  /Accumulated load-unload cycles:/{printf("accumulated_load_unload_cycles_value{"tag"} %s\n",$4);}
+  /Elements in grown defect list:/{printf("elements_in_grown_defect_list_value{"tag"} %s\n",$6);}
+  '
+}
+
 parse_smartctl_info() {
   local -i smart_available=0 smart_enabled=0 smart_healthy=0
-  local disk="$1" disk_type="$2"
+  local disk="$1" disk_type="$2" phy_id="$3" sas_address="$4"
+  #local data=$(cat)
+  #local phy_id=$(echo "${data}" | awk '/attached phy identifier =/{printf("%s",$5);exit;}')
+
   while read line ; do
     info_type="$(echo "${line}" | cut -f1 -d: | tr ' ' '_')"
     info_value="$(echo "${line}" | cut -f2- -d: | sed 's/^ \+//g')"
     case "${info_type}" in
       Model_Family) model_family="${info_value}" ;;
       Device_Model) device_model="${info_value}" ;;
-      Serial_Number) serial_number="${info_value}" ;;
+      Serial_Number|Serial_number) serial_number="${info_value}" ;;
       Firmware_Version) fw_version="${info_value}" ;;
       Vendor) vendor="${info_value}" ;;
       Product) product="${info_value}" ;;
@@ -103,14 +129,37 @@ parse_smartctl_info() {
     fi
   done
   if [[ -n "${vendor}" ]] ; then
-    echo "device_info{disk=\"${disk}\",type=\"${disk_type}\",vendor=\"${vendor}\",product=\"${product}\",revision=\"${revision}\",lun_id=\"${lun_id}\"} 1"
+    echo "device_info{disk=\"${disk}\",type=\"${disk_type}\",vendor=\"${vendor}\",product=\"${product}\",revision=\"${revision}\",serial_number=\"${serial_number}\",lun_id=\"${lun_id}\"} 1"
   else
     echo "device_info{disk=\"${disk}\",type=\"${disk_type}\",model_family=\"${model_family}\",device_model=\"${device_model}\",serial_number=\"${serial_number}\",firmware_version=\"${fw_version}\"} 1"
   fi
   echo "device_smart_available{disk=\"${disk}\",type=\"${disk_type}\"} ${smart_available}"
   echo "device_smart_enabled{disk=\"${disk}\",type=\"${disk_type}\"} ${smart_enabled}"
-  echo "device_smart_healthy{disk=\"${disk}\",type=\"${disk_type}\"} ${smart_healthy}"
+
+  echo "device_smart_healthy{disk=\"${disk}\",type=\"${disk_type}\",phy_id=\"${phy_id}\",sas_address=\"${sas_address}\"} ${smart_healthy}"
+  #if [ ${type} = "scsi" ]; then
+  #  echo "device_smart_healthy{disk=\"${disk}\",type=\"${disk_type}\",phy_id=\"${phy_id}\",sas_address=\"${sas_address}\"} ${smart_healthy}"
+  #else
+  #  echo "device_smart_healthy{disk=\"${disk}\",type=\"${disk_type}\"} ${smart_healthy}"
+  #fi
 }
+
+#parse_smartctl_sas_info() {
+#  awk '/attached phy identifier =/{printf("%s",$5);exit;}'
+#}
+
+parse_smartctl_sas_info() {
+  # Extract SAS info from Protocol Specific port log page for SAS SSP
+  # exit after 1st match
+  local data=$(cat)
+  # Attached Physical Identifier
+  local phy_id="$(echo "${data}" | awk '/attached phy identifier =/{printf("%s",$5);exit;}')"
+  # Attached SAS Address  
+  local sas_address="$(echo "${data}" | awk '/attached SAS address =/{printf("%s",$5);exit;}')"
+  # return values
+  echo "${phy_id} ${sas_address}"
+}
+
 
 output_format_awk="$(cat << 'OUTPUTAWK'
 BEGIN { v = "" }
@@ -143,7 +192,14 @@ for device in ${device_list}; do
   type="$(echo ${device} | cut -f2 -d'|')"
   echo "smartctl_run{disk=\"${disk}\",type=\"${type}\"}" $(TZ=UTC date '+%s')
   # Get the SMART information and health
-  /usr/sbin/smartctl -i -H -d "${type}" "${disk}" | parse_smartctl_info "${disk}" "${type}"
+  #/usr/sbin/smartctl -i -H -d "${type}" "${disk}" | parse_smartctl_info "${disk}" "${type}"
   # Get the SMART attributes
-  /usr/sbin/smartctl -A -d "${type}" "${disk}" | parse_smartctl_attributes "${disk}" "${type}"
+  if [ ${type} = "scsi" ]; then
+    read phy_id sas_address <<< "$(/usr/sbin/smartctl -x -d "${type}" "${disk}" | parse_smartctl_sas_info)"
+    /usr/sbin/smartctl -i -H -d "${type}" "${disk}" | parse_smartctl_info "${disk}" "${type}" "${phy_id}" "${sas_address}"
+    /usr/sbin/smartctl -A -d "${type}" "${disk}" | parse_smartctl_scsi_attributes "${disk}" "${type}" "${phy_id}" "${sas_address}"
+  else
+    /usr/sbin/smartctl -i -H -d "${type}" "${disk}" | parse_smartctl_info "${disk}" "${type}"
+    /usr/sbin/smartctl -A -d "${type}" "${disk}" | parse_smartctl_attributes "${disk}" "${type}"
+  fi
 done | format_output
